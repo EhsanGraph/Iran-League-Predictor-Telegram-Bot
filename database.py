@@ -3,6 +3,8 @@ import logging
 from contextlib import closing
 from typing import Optional, List, Dict, Any, Union
 from pathlib import Path
+import os
+
 
 # Configure logging
 logging.basicConfig(
@@ -12,7 +14,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class DatabaseManager:    
-    DB_NAME = 'bot.db'
+    DB_NAME = os.getenv("DATABASE_PATH", "bot.db")
     
     @classmethod
     def _get_connection(cls):

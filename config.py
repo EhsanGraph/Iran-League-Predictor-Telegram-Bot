@@ -17,7 +17,8 @@ load_dotenv()
 
 # Bot configuration
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
-ADMIN_IDS = [int(id) for id in os.getenv("ADMIN_IDS").split(",")]
+raw_admins = os.getenv("ADMIN_IDS", "").strip()
+ADMIN_IDS = [int(x) for x in raw_admins.split(",") if x.strip().isdigit()]
 
 # Game settings
 DEFAULT_SCORES = ["1-0", "2-1", "3-1", "0-0"]
