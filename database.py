@@ -3,8 +3,6 @@ import logging
 from contextlib import closing
 from typing import Optional, List, Dict, Any, Union
 from pathlib import Path
-import os
-
 
 # Configure logging
 logging.basicConfig(
@@ -13,12 +11,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class DatabaseManager:    
-    DB_NAME = os.getenv("DATABASE_PATH", "bot.db")
+class DatabaseManager:
+    """Centralized database operations with improved error handling"""
+    
+    DB_NAME = 'bot.db'
     
     @classmethod
     def _get_connection(cls):
-        conn = sqlite3.connect(cls.DB_NAME)
+        """Establish database connection with proper settings"""
+        conn = sqlite3.connect(cls.DB_NAME)  # استفاده از cls.DB_NAME
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         return conn
@@ -29,6 +30,7 @@ class DatabaseManager:
         params: tuple = (), 
         fetch_one: bool = False
     ) -> Union[List[Dict[str, Any]], Dict[str, Any], None]:
+        """Execute a read query with proper error handling"""
         try:
             with closing(DatabaseManager._get_connection()) as conn:
                 with closing(conn.cursor()) as cur:
@@ -43,6 +45,7 @@ class DatabaseManager:
 
     @staticmethod
     def get_current_week() -> int:
+        """Get the current week from database"""
         try:
             with closing(DatabaseManager._get_connection()) as conn:
                 cursor = conn.cursor()
@@ -55,6 +58,7 @@ class DatabaseManager:
 
     @staticmethod
     def set_current_week(week: int) -> bool:
+        """Set the current week in database"""
         try:
             with closing(DatabaseManager._get_connection()) as conn:
                 conn.execute(f"PRAGMA user_version = {week}")
@@ -65,7 +69,45 @@ class DatabaseManager:
             return False
 
     @staticmethod
+    def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
+        try:
+            with closing(DatabaseManager._get_connection()) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT value FROM settings WHERE key = ?", (key,))
+                row = cur.fetchone()
+                return row[0] if row else default
+        except Exception:
+            return default
+
+    @staticmethod
+    def set_setting(key: str, value: str) -> bool:
+        try:
+            with closing(DatabaseManager._get_connection()) as conn:
+                conn.execute("""
+                    INSERT INTO settings(key, value, updated_at)
+                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP
+                """, (key, value))
+                conn.commit()
+                return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def lock_week(week: int) -> bool:
+        return DatabaseManager.set_setting(f"lock_week_{week}", "1")
+
+    @staticmethod
+    def unlock_week(week: int) -> bool:
+        return DatabaseManager.set_setting(f"lock_week_{week}", "0")
+
+    @staticmethod
+    def is_week_locked(week: int) -> bool:
+        return DatabaseManager.get_setting(f"lock_week_{week}", "0") == "1"
+
+    @staticmethod
     def get_user_predictions(user_id: int, week: Optional[int] = None) -> List[Dict]:
+        """Get user predictions with optional week filter"""
         query = """
             SELECT p.*, m.home_team, m.away_team, m.result 
             FROM predictions p
@@ -98,10 +140,12 @@ class DatabaseManager:
 
     @staticmethod
     def initialize_database():
+        """ایجاد جداول اولیه پایگاه داده"""
         try:
             with sqlite3.connect(DatabaseManager.DB_NAME) as conn:
                 cursor = conn.cursor()
                 
+                # ایجاد جدول کاربران
                 cursor.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
@@ -111,6 +155,7 @@ class DatabaseManager:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )""")
                 
+                # ایجاد جدول مسابقات
                 cursor.execute("""
                 CREATE TABLE IF NOT EXISTS matches (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -122,6 +167,7 @@ class DatabaseManager:
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )""")
                 
+                # ایجاد جدول پیش‌بینی‌ها با ساختار اصلاح شده
                 cursor.execute("""
                 CREATE TABLE IF NOT EXISTS predictions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -140,6 +186,7 @@ class DatabaseManager:
                     UNIQUE(user_id, match_id)
                 )""")
                 
+                # ایجاد جدول تنظیمات
                 cursor.execute("""
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
@@ -147,6 +194,7 @@ class DatabaseManager:
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )""")
                 
+                # تنظیم هفته جاری
                 cursor.execute("""
                 INSERT OR IGNORE INTO settings (key, value) 
                 VALUES ('current_week', '1')
@@ -158,3 +206,6 @@ class DatabaseManager:
         except sqlite3.Error as e:
             logger.error(f"خطا در راه‌اندازی پایگاه داده: {e}")
             raise
+
+
+

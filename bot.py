@@ -11,18 +11,33 @@ from database import DatabaseManager
 import sqlite3
 import time
 from datetime import datetime
+from html import escape
 
+# Configure logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
+# Conversation states
 SELECT_SCORE, SELECT_WINNER = range(2)
 current_week_cache = {"value": None, "timestamp": 0}
 SET_RESULT_MATCH, SET_RESULT_SCORE, SET_RESULT_WINNER, SET_RESULT_CONFIRM = range(3, 7)
 
 class BotHandlers:
+    @staticmethod
+    def _ltr(text: str) -> str:
+        return f"\u200E{text}\u200E"  # LRM sandwich
+
+    @staticmethod
+    def _rtl_line(text: str) -> str:
+        return f"\u200F{text}"  # RLM prefix
+
+    @staticmethod
+    def _rtl(text: str) -> str:
+        return f"\u202B{text}\u202C"
+
     @staticmethod
     def validate_score(score: str) -> bool:
         try:
@@ -57,6 +72,10 @@ class BotHandlers:
         current_week_cache["value"] = current_week
         current_week_cache["timestamp"] = now
         return current_week
+    
+    @staticmethod
+    def _ensure_week_open(week: int) -> bool:
+        return not DatabaseManager.is_week_locked(week)
 
     @staticmethod
     def register_user(user) -> bool:
@@ -167,6 +186,12 @@ class BotHandlers:
                 return ConversationHandler.END
 
             current_week = BotHandlers.get_cached_current_week()
+
+            if not BotHandlers._ensure_week_open(current_week):
+                msg = update.message or update.callback_query.message
+                await msg.reply_text(f"🔒 پیش‌بینی‌های هفته {current_week} بسته است.")
+                return ConversationHandler.END
+
             if current_week is None:
                 logger.error("خطا در دریافت هفته جاری")
                 msg = update.message or update.callback_query.message
@@ -207,7 +232,7 @@ class BotHandlers:
         try:
             action, value = query.data.split("|")
             if value == "manual":
-                await query.edit_message_text(
+                await query.message.reply_text(
                     "✍️ لطفاً نتیجه را به صورت عدد وارد کنید.\nمثال: 2-1\n"
                     f"حداکثر طول مجاز: {MAX_SCORE_LENGTH} کاراکتر"
                 )
@@ -352,8 +377,41 @@ class BotHandlers:
             await update.message.reply_text("⚠️ خطا در بروزرسانی هفته.")
 
     @staticmethod
+    async def prev_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        try:
+            if update.effective_user.id not in ADMIN_IDS:
+                await update.message.reply_text("⛔ فقط برای مدیران")
+                return
+            current = BotHandlers.get_cached_current_week()
+            new_week = max(1, current - 1)
+            DatabaseManager.set_current_week(new_week)
+            current_week_cache["value"] = None
+            await update.message.reply_text(f"📆 هفته جاری به {new_week} تغییر یافت (⏪).")
+        except Exception as e:
+            logger.error(f"خطا در prev_week: {e}")
+            await update.message.reply_text("⚠️ خطا در بروزرسانی هفته.")
+
+    @staticmethod
+    async def close_bets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user.id not in ADMIN_IDS:
+            await update.message.reply_text("⛔ فقط برای مدیران")
+            return
+        week = BotHandlers.get_cached_current_week()
+        DatabaseManager.lock_week(week)
+        await update.message.reply_text(f"🔒 پایان پیش‌بینی‌های هفته {week} اعلام شد. از این لحظه، ثبت/ویرایش ممکن نیست.")
+
+    @staticmethod
+    async def open_bets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user.id not in ADMIN_IDS:
+            await update.message.reply_text("⛔ فقط برای مدیران")
+            return
+        week = BotHandlers.get_cached_current_week()
+        DatabaseManager.unlock_week(week)
+        await update.message.reply_text(f"✅ پیش‌بینی‌های هفته {week} باز شد.")
+
+
+    @staticmethod
     async def _send_prediction_success(query, week: int, score: str, winner: str):
-        """ارسال پیام موفقیت ثبت پیش‌بینی"""
         await query.edit_message_text(
             f"✅ پیش‌بینی ذخیره شد:\n"
             f"📅 هفته {week}\n"
@@ -371,6 +429,18 @@ class BotHandlers:
             _, winner = query.data.split("|")
             user = update.effective_user
             match_data = context.user_data
+
+            if not BotHandlers._ensure_week_open(match_data['week']):
+                await query.edit_message_text(f"🔒 پیش‌بینی‌های هفته {match_data['week']} بسته است.")
+                return ConversationHandler.END
+
+            row = DatabaseManager.execute_query(
+                "SELECT result FROM matches WHERE id = ?",
+                (match_data['match_id'],), fetch_one=True
+            )
+            if row and row["result"]:
+                await query.edit_message_text("⛔ نتیجه بازی ثبت شده؛ امکان تغییر نیست.")
+                return ConversationHandler.END
             
             success = DatabaseManager.execute_write(
                 """
@@ -397,46 +467,120 @@ class BotHandlers:
             )
             return ConversationHandler.END
 
+
+
     @staticmethod
     async def my_predictions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             user_id = update.effective_user.id
             args = context.args
-            
-            week_filter = int(args[0]) if args and args[0].isdigit() else None
-            
+
+            if args:
+                try:
+                    week_filter = int(args[0])
+                except (ValueError, TypeError):
+                    week_filter = None
+            else:
+                week_filter = BotHandlers.get_cached_current_week()
+
+
             predictions = DatabaseManager.get_user_predictions(user_id, week_filter)
-            
+
+            msg = update.message or (update.callback_query.message if update.callback_query else None)
+
             if not predictions:
-                msg = "هنوز هیچ پیش‌بینی ثبت نکرده‌اید."
-                if week_filter:
-                    msg = f"پیش‌بینی‌ای برای هفته {week_filter} ثبت نکرده‌اید."
-                await update.message.reply_text(msg)
+                text = f"پیش‌بینی‌ای برای هفته {week_filter} ثبت نکرده‌اید." if week_filter else "هنوز هیچ پیش‌بینی ثبت نکرده‌اید."
+                if msg:
+                    await msg.reply_text(text)
                 return
-                
-            response = ["📊 پیش‌بینی‌های شما:"]
-            for pred in predictions:
+
+            lines = [f"📊 پیش‌بینی‌های شما - هفته {week_filter}:"]
+            for row in predictions:
+                pred = dict(row)
+
+                home   = pred["home_team"]
+                away   = pred["away_team"]
+                raw    = str(pred["score"] or "").replace("–", "-").replace("−", "-")
+                winner = pred["winner"] or "?"
+                result_exists = (pred["result"] is not None)
+                points = pred["points"]
+
+                try:
+                    a_str, b_str = [p.strip() for p in raw.split("-", 1)]
+                    a = int(a_str) if a_str.isdigit() else 0
+                    b = int(b_str) if b_str.isdigit() else 0
+                except Exception:
+                    a, b = 0, 0
+
                 status = ""
-                if pred['result']:
-                    if pred['points'] is not None:
-                        status = f" ✅ ({pred['points']} امتیاز)"
-                    else:
-                        status = " ⏳ (در انتظار امتیازدهی)"
-                
-                response.append(
-                    f"\n📅 هفته {pred['week']}: "
-                    f"{pred['home_team']} {pred['score']} {pred['away_team']}\n"
-                    f"🏆 برنده: {pred['winner']}{status}"
+                if result_exists:
+                    status = f" ✅ ({points} امتیاز)" if points is not None else " ⏳ (در انتظار امتیازدهی)"
+
+                home_e   = escape(home)
+                away_e   = escape(away)
+                winner_e = escape(winner)
+
+                lines.append(
+                    f"\n⚽️ بازی : {away_e} | {home_e}"
+                    f"\n📅 نتیجه : <code>{a}-{b}</code>"
+                    f"\n🏆 برنده: {winner_e}{status}"
                 )
-                
-            await update.message.reply_text("\n".join(response))
-            
+
+                is_current_week = (pred["week"] == BotHandlers.get_cached_current_week())
+                can_edit = is_current_week and (not DatabaseManager.is_week_locked(pred["week"])) and (pred["result"] is None)
+
+                text = (
+                    f"\n⚽️ بازی : {escape(pred['away_team'])} | {escape(pred['home_team'])}"
+                    f"\n📅 نتیجه : <code>{(pred['score'] or '').replace('–','-').replace('−','-')}</code>"
+                    f"\n🏆 برنده: {escape(pred['winner'] or '?')}"
+                )
+                if can_edit:
+                    kb = InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("✏️ ویرایش", callback_data=f"edit|{pred['match_id']}")]]
+                    )
+                    await msg.reply_text(text, parse_mode="HTML", reply_markup=kb)
+                else:
+                    await msg.reply_text(text, parse_mode="HTML")
+
+
         except Exception as e:
-            logger.error(f"خطا در my_predictions: {e}")
-            await update.message.reply_text(
-                "⚠️ خطایی در دریافت پیش‌بینی‌ها رخ داده است.\n"
-                "فرمت صحیح: /mybets [شماره_هفته]"
-            )
+            logger.error(f"خطا در my_predictions: {e}", exc_info=True)
+            msg = update.message or (update.callback_query.message if update.callback_query else None)
+            if msg:
+                await msg.reply_text(
+                    "⚠️ خطایی در دریافت پیش‌بینی‌ها رخ داده است.\n"
+                    "فرمت صحیح: /mybets [شماره_هفته]"
+                )
+
+    @staticmethod
+    async def edit_prediction_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        _, match_id = query.data.split("|")
+
+        row = DatabaseManager.execute_query(
+            "SELECT id, week, home_team, away_team, result FROM matches WHERE id = ?",
+            (match_id,), fetch_one=True
+        )
+        if not row:
+            await query.edit_message_text("⚠️ بازی یافت نشد.")
+            return ConversationHandler.END
+        if DatabaseManager.is_week_locked(row["week"]):
+            await query.edit_message_text(f"🔒 پیش‌بینی‌های هفته {row['week']} بسته است.")
+            return ConversationHandler.END
+        if row["result"]:
+            await query.edit_message_text("⛔ نتیجه بازی ثبت شده؛ امکان ویرایش نیست.")
+            return ConversationHandler.END
+
+        context.user_data.clear()
+        context.user_data.update({
+            "match_id": row["id"],
+            "home": row["home_team"],
+            "away": row["away_team"],
+            "week": row["week"]
+        })
+        await BotHandlers._send_match_prediction_request(query.message, row["week"], row["home_team"], row["away_team"])
+        return SELECT_SCORE
             
 
     @staticmethod
@@ -575,6 +719,7 @@ class BotHandlers:
         match_data = context.user_data["setresult"]
         match_data["winner"] = winner
         
+        # تأیید نهایی
         keyboard = [
             [InlineKeyboardButton("✅ تأیید و ثبت نتیجه", callback_data="setresult_confirm|1")],
             [InlineKeyboardButton("❌ انصراف", callback_data="setresult_confirm|0")]
@@ -672,21 +817,25 @@ class BotHandlers:
         help_text = [
             "📚 *راهنمای خفن ربات پیش‌بینی فوتبال* 📚",
             "",
+            "فراموش نکنید هر پیشبینی درست یک سگ تو روح جنت میباشد !",
             "",
             "🔹 *دستورات عمومی:*",
             "",
             "🔸 /start - شروع پیش‌بینی بازی‌های این هفته (بزن بریم!)",
-            "🔸 /mybets - ببین این دفعه چه کردی ، هنوز شانسی هست؟",
+            "🔸 /mybets - ببین این دفعه چطوری ریدی ، هنوز شانسی هست؟",
             "🔸 /matches - لیست بازی‌های این هفته رو ببین و نظر بده",
             "🔸 /week - شماره هفته فعلی رو نشونت میده (چندمین هفته ایم؟)",
             "🔸 /champion - جدول قهرمان‌ها! خوبان عالم ؟ 😎",
             "🔸 /helpme - همین راهنمای جذاب رو دوباره نشون بده",
             "",
-            "🔹 *دستورات مدیریتی (فقط مخصوص ادمین‌های قدر قدرت):*",
+            "⚙️ *دستورات مدیریتی (فقط مخصوص ادمین‌های قدر قدرت):*",
             "",
             "🔸 /setresult - وارد کردن نتیجه واقعی بازی‌ها (تعیین سرنوشت!)",
             "🔸 /nextweek - بزن بریم هفته بعد! ⏩",
             "🔸 /startweek - اعلام رسمی شروع هفته به همه بچه‌ها 📢",
+            "🔸 /prevweek - برگشت به هفته قبل",
+            "🔸 /closebets - بستن پیش‌بینی‌های هفته جاری",
+            "🔸 /openbets - باز کردن مجدد پیش‌بینی‌های هفته جاری",
             "",
             "📝 *چجوری بازی کنیم؟*",
             "",
@@ -702,8 +851,11 @@ class BotHandlers:
             "🥈 فقط برنده رو درست گفتی؟ *3 امتیاز* هم غنیمته!",
             "🥉 یه عدد رو درست زدی؟ *1 امتیاز* هم نوش جونت!",
             "",
+            "📬 *پشتیبانی:*",
+            "اگه مشکلی داشتی... محمدرضا اونجاست، فحش ندی روزش شب نمیشه مرتیکه دلال ! ... 😅",
+            "",
             "🏆 *لیگ برتر فوتبال ایران*",
-            "🤖 نسخه ربات: 1.0.1 – بیا قهرمان شو!"
+            "🤖 نسخه ربات: 1.0.3 – بیا قهرمان شو!"
         ]
 
         
@@ -801,6 +953,7 @@ class BotHandlers:
 
     @staticmethod
     async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """مدیریت خطاهای سراسری"""
         logger.error(f"آپدیت {update} باعث خطا شد: {context.error}")
         if update.effective_message:
             await update.effective_message.reply_text("⚠️ متأسفانه خطایی رخ داده است. لطفاً دوباره امتحان کنید.")
@@ -857,7 +1010,10 @@ def setup_bot():
             .build()
 
         conv_handler = ConversationHandler(
-            entry_points=[CommandHandler("start", BotHandlers.start)],
+            entry_points=[
+            CommandHandler("start", BotHandlers.start),
+            CallbackQueryHandler(BotHandlers.edit_prediction_start, pattern=r"^edit\|"),
+            ],
             states={
                 SELECT_SCORE: [
                     CallbackQueryHandler(BotHandlers.handle_score, pattern=r"^score\|"),
@@ -902,7 +1058,11 @@ def setup_bot():
         app.add_handler(CommandHandler("matches", BotHandlers.matches_handler))
         app.add_handler(CommandHandler("startweek", BotHandlers.start_week_command))
         app.add_handler(CommandHandler("myguesses", BotHandlers.my_predictions))
-
+        app.add_handler(CommandHandler("prevweek", BotHandlers.prev_week))
+        app.add_handler(CommandHandler("closebets", BotHandlers.close_bets))
+        app.add_handler(CommandHandler("openbets", BotHandlers.open_bets))
+        
+        app.add_handler(CallbackQueryHandler(BotHandlers.handle_quick_start, pattern="^start$"))
         app.add_handler(CallbackQueryHandler(BotHandlers.handle_quick_start, pattern="^quick_start$"))
         app.add_handler(CallbackQueryHandler(BotHandlers.handle_my_predictions, pattern="^my_predictions$"))
         app.add_handler(CallbackQueryHandler(BotHandlers.handle_leaderboard, pattern="^leaderboard$"))
